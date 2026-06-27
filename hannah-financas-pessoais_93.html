@@ -428,7 +428,7 @@ const {useState,useEffect,useLayoutEffect,useMemo,useRef,useCallback,createConte
 /* =========================================================================
    1. UTILITÁRIOS
    ========================================================================= */
-const SCHEMA_VERSION = 93;
+const SCHEMA_VERSION = 94;
 const uid = (p='id') => p+'_'+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4);
 const round2 = n => Math.round((Number(n)+Number.EPSILON)*100)/100;
 const clamp = (n,a,b)=>Math.max(a,Math.min(b,n));
@@ -517,24 +517,74 @@ function makeBankMovement(fields) {
   };
 }
 
-// Detecta pagamento de fatura de cartão com níveis de confiança (v93)
-// ALTA: contém termo de pagamento/débito + (fatura|cartão|emissor)
-// MÉDIA: emissor + débito sem "fatura" → sugere mas não classifica
-// BAIXA: só nome do banco → não classifica automaticamente
-const CARD_BILL_PAYMENT_TERMS = ['pagamento','pagto','pag.','debito','débito','quitacao','quitação','liquidacao','liquidação'];
-const CARD_BILL_INVOICE_TERMS = ['fatura','cartao','cartão'];
-const CARD_BILL_ISSUERS = ['nubank','itaucard','itau card','credicard','ourocard','bradescard','c6 bank','banco inter','inter ','santander','bradesco','elo card','hipercard','will bank'];
+// Detecta pagamento de fatura de cartão com níveis de confiança (v94)
+// ALTA: termo de pagamento/débito + (fatura|cartão) — classifica automaticamente
+// MÉDIA: emissor + termo de débito/pagamento mas sem "fatura"/"cartão" — sugere, pede confirmação
+// BAIXA: só nome do emissor/banco — não classifica como fatura
+const CARD_BILL_PAYMENT_TERMS = ['pagamento','pagto','pgto','pag.','debito','débito','deb.','quitacao','quitação','liquidacao','liquidação','deb automatico','deb automático','débito automático','debito automatico'];
+const CARD_BILL_INVOICE_TERMS = ['fatura','cartao','cartão','card'];
+const CARD_BILL_ISSUERS = ['nubank','itaucard','itau card','credicard','ourocard','bradescard','c6 bank','banco inter','inter ','santander','bradesco','elo card','hipercard','will bank','neon','next bank','pan bank','bmg','sicoob','sicredi','sofisa','modal','agi bank'];
 function cardBillConfidence(desc) {
   const d = (desc||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
-  const hasTerm = CARD_BILL_PAYMENT_TERMS.some(t=>d.includes(t));
+  const hasTerm = CARD_BILL_PAYMENT_TERMS.some(t=>d.includes(t.normalize('NFD').replace(/[\u0300-\u036f]/g,'')));
   const hasInvoice = CARD_BILL_INVOICE_TERMS.some(t=>d.includes(t));
   const hasIssuer = CARD_BILL_ISSUERS.some(t=>d.includes(t.normalize('NFD').replace(/[\u0300-\u036f]/g,'')));
-  if(hasTerm && (hasInvoice || hasIssuer)) return 'high';   // classifica automaticamente
-  if(hasIssuer && hasTerm) return 'medium';                 // sugere, pede confirmação
-  return 'low';                                             // não classifica
+  // v94: PIX recebido / transferência / aplicação / resgate NÃO são fatura
+  if(/pix\s*(recebido|entrada|credito)|transfer(encia|ência)|aplicac|resgate|recebimento/i.test(d)) return 'low';
+  if(hasTerm && hasInvoice) return 'high';   // pagamento/débito + fatura/cartão → alta confiança
+  if(hasTerm && hasIssuer) return 'medium';  // pagamento/débito + emissor mas sem "fatura" → média
+  return 'low';                              // só emissor ou nada → não classifica
 }
 function isCardBillPayment(desc) {
   return cardBillConfidence(desc) === 'high';
+}
+
+// Tipos de movimentação bancária (v94)
+const MOV_TYPES = {
+  pagamento_fatura:    { label:'Pagamento de fatura',        impactaSaldo:true,  criaDespesa:false },
+  compra_debito:       { label:'Compra no débito',            impactaSaldo:true,  criaDespesa:true  },
+  debito_automatico:   { label:'Débito automático',           impactaSaldo:true,  criaDespesa:true  },
+  pix_terceiro:        { label:'PIX para terceiro',           impactaSaldo:true,  criaDespesa:true  },
+  boleto:              { label:'Boleto / conta paga',         impactaSaldo:true,  criaDespesa:true  },
+  transferencia_propria:{ label:'Transferência entre contas', impactaSaldo:true,  criaDespesa:false },
+  saque:               { label:'Saque',                       impactaSaldo:true,  criaDespesa:false },
+  aplicacao:           { label:'Aplicação / investimento',    impactaSaldo:true,  criaDespesa:false },
+  tarifa:              { label:'Tarifa bancária',              impactaSaldo:true,  criaDespesa:true  },
+  imposto:             { label:'Imposto / taxa',              impactaSaldo:true,  criaDespesa:true  },
+  estorno:             { label:'Estorno / devolução',         impactaSaldo:true,  criaDespesa:false },
+  ajuste_saldo:        { label:'Ajuste de saldo',             impactaSaldo:true,  criaDespesa:false },
+  entrada:             { label:'Entrada / receita',           impactaSaldo:true,  criaDespesa:false },
+  nao_classificado:    { label:'Não classificada',            impactaSaldo:true,  criaDespesa:false },
+};
+
+// Classifica automaticamente uma linha do extrato (v94)
+function classifyMovement(desc, rawType) {
+  if(rawType === 'receita') return { movType:'entrada', confidence:'high' };
+  const d = (desc||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+  const billConf = cardBillConfidence(desc);
+  if(billConf === 'high') return { movType:'pagamento_fatura', confidence:'high' };
+  if(billConf === 'medium') return { movType:'pagamento_fatura', confidence:'medium' };
+  if(/transfer(encia|ência)/.test(d) && /(propri|conta|cc\b|poupan|invest|ted|doc)/.test(d))
+    return { movType:'transferencia_propria', confidence:'medium' };
+  if(/\baplic(acao|ação|ar)\b|invest(imento)?\b|\bcdb\b|\blci\b|\blca\b|\brdb\b|tesouro\s+direto|poupan/i.test(d))
+    return { movType:'aplicacao', confidence:'high' };
+  if(/resgate|retirada\s+(invest|aplic|poupan)/i.test(d))
+    return { movType:'estorno', confidence:'medium' };
+  if(/\bsaque\b|caixa\s*(eletronico|eletrônico|24h)|\batm\b/i.test(d))
+    return { movType:'saque', confidence:'high' };
+  if(/tarifa|manut(encao|enção)\s+conta|anuidade|taxa\s+adm/i.test(d))
+    return { movType:'tarifa', confidence:'high' };
+  if(/\biof\b|imposto|\bicsm\b|\biss\b|\birpj\b/i.test(d))
+    return { movType:'imposto', confidence:'high' };
+  if(/\bdeb(ito)?\s*auto|\bdebit\s*auto|\bd\.?a\.?\b/i.test(d))
+    return { movType:'debito_automatico', confidence:'high' };
+  if(/\bpix\b/i.test(d)) return { movType:'pix_terceiro', confidence:'high' };
+  if(/boleto|pag(amento)?\s+(de\s+)?bol/i.test(d))
+    return { movType:'boleto', confidence:'high' };
+  if(/estorno|devolu(cao|ção)|reembolso|credito\s+(em|na)\s+conta/i.test(d))
+    return { movType:'estorno', confidence:'high' };
+  if(rawType === 'despesa') return { movType:'compra_debito', confidence:'low' };
+  return { movType:'nao_classificado', confidence:'low' };
 }
 
 // Função centralizada de receitas — usada em TODOS os módulos
@@ -775,6 +825,41 @@ function migrateToV93(data) {
     migrations: prevMigs,
   };
   data.schemaVersion = 93;
+  return data;
+}
+
+function migrateToV94(data) {
+  if((data.metadata||{}).schemaVersion >= 94) return data;
+  const now = new Date().toISOString();
+
+  if(!data.bankMovements) data.bankMovements = [];
+  if(!data.paymentRecords) data.paymentRecords = [];
+  if(!data.metadata) data.metadata = {};
+
+  // Identificar possíveis pagamentos de fatura lançados como despesas
+  const auditItems = data.auditV94Items || [];
+  (data.transactions||[]).forEach(t=>{
+    if(t.type!=='despesa') return;
+    if(t.isBillPayment) return; // já marcado
+    const conf = cardBillConfidence(t.descOrig||'');
+    if(conf==='high'||conf==='medium'){
+      const alreadyFlagged = auditItems.some(a=>a.transactionId===t.id&&a.type==='possible_bill_payment_as_expense');
+      if(!alreadyFlagged){
+        auditItems.push({
+          id:uid('a94'),type:'possible_bill_payment_as_expense',
+          description:'Possível pagamento de fatura lançado como despesa: '+(t.descOrig||'')+'  ·  R$ '+(Number(t.amount||0).toFixed(2)),
+          transactionId:t.id,amount:t.amount,date:t.date,confidence:conf,
+          status:'pending',createdAt:now,
+        });
+      }
+    }
+  });
+  data.auditV94Items = auditItems;
+
+  const prevMigs = (data.metadata.migrations||[]);
+  if(!prevMigs.includes('93_to_94')) prevMigs.push('93_to_94');
+  data.metadata = { ...(data.metadata||{}), schemaVersion:94, migratedAt:now, migrations:prevMigs };
+  data.schemaVersion = 94;
   return data;
 }
 
@@ -1900,6 +1985,14 @@ function Provider({children}){
             store.set('mcf:metadata', next.metadata);
           }
         } catch(e) { console.error('[HANNAH] Migração v93 falhou:',e); }
+        try {
+          const mig94 = migrateToV94(next);
+          if((mig94.metadata||{}).schemaVersion===94) {
+            Object.assign(next, mig94);
+            store.set('mcf:bankMovements', next.bankMovements);
+            store.set('mcf:metadata', next.metadata);
+          }
+        } catch(e) { console.error('[HANNAH] Migração v94 falhou:',e); }
         if(!cancelled){ setSt(next); }
       }
       if(!cancelled) setReady(true);
@@ -1951,39 +2044,63 @@ function Provider({children}){
     cardById:id=>st.cards.find(c=>c.id===id),
     accountById:id=>st.accounts.find(a=>a.id===id),
 
-    addStatement:({despesas,receitas,fileMeta})=>{
+    addStatement:({despesas,billPayments,receitas,patrimonial,fileMeta})=>{
+      // v94: addStatement suporta 4 payloads separados por tipo de movimentação:
+      // despesas → criam transaction + bankMovement (saída)
+      // billPayments → somente bankMovement do tipo card_bill_payment (não cria transaction)
+      // receitas → auditIncomes + bankMovement (entrada)
+      // patrimonial → somente bankMovement (aplicacao/saque/estorno/ajuste)
       const fileId=uid('file');
-      const count=(despesas?.length||0)+(receitas?.length||0);
+      const count=(despesas?.length||0)+(billPayments?.length||0)+(receitas?.length||0)+(patrimonial?.length||0);
       save('files',f=>[{id:fileId,...(fileMeta||{}),kind:'extrato',importedAt:new Date().toISOString(),count},...(f||[])]);
       const now=new Date().toISOString();
       const newMovements=[];
 
+      // --- despesas que criam lançamento ---
       if(despesas&&despesas.length){
         const ready=despesas.map(t=>{
           const txId=uid('tx');
-          // v92: detectar pagamento de fatura — não criar como nova despesa comum
-          const isBillPay=isCardBillPayment(t.descOrig||'');
-          const movType=isBillPay?'card_bill_payment':'expense';
-          // criar bankMovement para cada despesa/saída
           if(t.accountId){
             newMovements.push(makeBankMovement({accountId:t.accountId,date:t.date,
               description:t.descOrig||'',amount:Math.abs(Number(t.amount)),direction:'saida',
-              movementType:movType,transactionId:isBillPay?null:txId,
+              movementType:t.movementType||'expense',transactionId:txId,
               importId:fileId,source:'import',reconciliationStatus:'pending'}));
           }
           return {id:txId,accountId:t.accountId||null,installmentGroupId:null,currency:'BRL',fxAmount:null,
             origin:'extrato',fileId,confStatus:(t.confidence||0)>=0.6?'ok':'revisar',descPad:t.descOrig,history:[],
             createdAt:now,updatedAt:now,isFixed:false,isSubscription:false,subcategory:null,categoryId:null,
-            cardId:null,paymentType:'conta',isBillPayment:isBillPay,...t};
+            cardId:null,isBillPayment:false,...t};
         });
-        // pagamentos de fatura não entram em transactions (não duplicam despesas)
-        const txOnly=ready.filter(t=>!t.isBillPayment);
-        if(txOnly.length) save('transactions',tx=>[...txOnly,...(tx||[])]);
+        if(ready.length) save('transactions',tx=>[...ready,...(tx||[])]);
       }
 
+      // --- pagamentos de fatura: somente saída bancária, sem transaction ---
+      if(billPayments&&billPayments.length){
+        billPayments.forEach(t=>{
+          if(t.accountId){
+            newMovements.push(makeBankMovement({accountId:t.accountId,date:t.date,
+              description:t.descOrig||'',amount:Math.abs(Number(t.amount)),direction:'saida',
+              movementType:'card_bill_payment',transactionId:null,
+              importId:fileId,source:'import',reconciliationStatus:'pending'}));
+          }
+        });
+      }
+
+      // --- movimentações patrimoniais (aplicacao, saque, estorno, ajuste): somente bankMovement ---
+      if(patrimonial&&patrimonial.length){
+        patrimonial.forEach(t=>{
+          if(t.accountId){
+            const dir=['estorno','ajuste_saldo'].includes(t.movementType)?'entrada':'saida';
+            newMovements.push(makeBankMovement({accountId:t.accountId,date:t.date,
+              description:t.descOrig||'',amount:Math.abs(Number(t.amount)),direction:dir,
+              movementType:t.movementType||'unclassified',transactionId:null,
+              importId:fileId,source:'import',reconciliationStatus:'pending'}));
+          }
+        });
+      }
+
+      // --- receitas: auditoria + bankMovement ---
       if(receitas&&receitas.length){
-        // v92: entradas SEMPRE geram bankMovement (afetam saldo imediatamente)
-        // mas ficam pendentes de classificação no módulo de receitas
         receitas.forEach(r=>{
           if(r.accountId){
             newMovements.push(makeBankMovement({accountId:r.accountId,date:r.date,
@@ -2198,7 +2315,7 @@ function Provider({children}){
       for(const k of KEYS) await store.set('mcf:'+k,next[k]); setSt(next); toast('Dados de demonstração recarregados.'); },
     wipe:async()=>{ const cats=buildCats();
       const next={transactions:[],cards:[],accounts:[],acctMoves:[],transfers:[],assets:[],goals:[],categories:cats,rules:seedRulesFor(cats),
-        fixed:[],incomes:[],budgets:[],renegotiations:[],notes:[],splits:[],files:[],auditIncomes:[],bankMovements:[],paymentRecords:[],attachments:[],settings:st.settings,metadata:{schemaVersion:93,migratedAt:new Date().toISOString(),migrations:['wipe']}};
+        fixed:[],incomes:[],budgets:[],renegotiations:[],notes:[],splits:[],files:[],auditIncomes:[],bankMovements:[],paymentRecords:[],attachments:[],settings:st.settings,metadata:{schemaVersion:94,migratedAt:new Date().toISOString(),migrations:['wipe']}};
       for(const k of KEYS) await store.set('mcf:'+k,next[k]); setSt(next); toast('Todos os dados foram apagados.','warn'); },
     applyRules:(tx)=>applyRules(tx,st.rules,st.categories),
   };
@@ -3088,6 +3205,35 @@ function runFinancialAudit(db) {
     const maxCur = nums.length ? Math.max(...nums) : 0;
     const total = txs[0]?.installmentTotal||0;
     if(total && maxCur > total) addIssue('INST_OVER_TOTAL','Parcela atual maior que total declarado','Sequência impossível','installmentGroup',gid);
+  });
+
+  // v94: detectar pagamento de fatura lançado como despesa (duplicidade)
+  (db.transactions||[]).forEach(t=>{
+    if(t.type!=='despesa'||t.isBillPayment) return;
+    const conf=cardBillConfidence(t.descOrig||'');
+    if(conf==='high'){
+      addIssue('BILL_AS_EXPENSE',
+        `Possível pagamento de fatura lançado como despesa: ${t.descOrig||''} · ${BRL(t.amount)}`,
+        'Pode estar duplicando despesas da fatura importada',
+        'transaction',t.id);
+    }
+  });
+
+  // v94: despesa de extrato com mesmo valor e data próxima de um bankMovement card_bill_payment
+  const billBMs=(db.bankMovements||[]).filter(m=>m.movementType==='card_bill_payment');
+  (db.transactions||[]).filter(t=>t.type==='despesa'&&!t.isBillPayment&&t.origin==='extrato').forEach(t=>{
+    const tDate=new Date((t.date||'')+'T00:00:00');
+    const match=billBMs.find(m=>{
+      const mDate=new Date((m.date||'')+'T00:00:00');
+      const dayDiff=Math.abs((tDate-mDate)/(1000*60*60*24));
+      return dayDiff<=5 && Math.abs(Number(t.amount)-Number(m.amount))<0.02 && m.accountId===t.accountId;
+    });
+    if(match){
+      addIssue('BILL_EXTRATO_DUP',
+        `Despesa do extrato pode ser duplicata de pagamento de fatura: ${t.descOrig||''} · ${BRL(t.amount)}`,
+        `Impacto duplicado: ${BRL(t.amount)} pode estar sendo somado duas vezes`,
+        'transaction',t.id);
+    }
   });
 
   return issues;
@@ -4029,14 +4175,12 @@ function ImportarExtrato({go}){
   const [busy,setBusy]=useState(false);
   const [prog,setProg]=useState('');
   const [drag,setDrag]=useState(false);
-  const [data,setData]=useState(null); // {rows, meta, fileName, file}
-  const [bulkCat,setBulkCat]=useState(''); const [bulkSub,setBulkSub]=useState(''); // categoria em massa na revisão
-  const [acctId,setAcctId]=useState('');      // §B5 — conta de destino do extrato
+  const [data,setData]=useState(null);
+  const [acctId,setAcctId]=useState('');
   const [forceComp,setForceComp]=useState(false);
   const [compMk,setCompMk]=useState(monthKey(todayISO()));
   const fileRef=useRef(null);
   const extFiles=(db.files||[]).filter(f=>f.kind==='extrato');
-  // (§3) filtros da lista de extratos importados
   const [xAno,setXAno]=useState('all'); const [xMes,setXMes]=useState('all');
   const [xBanco,setXBanco]=useState(''); const [xBusca,setXBusca]=useState('');
   const [xTipo,setXTipo]=useState(''); const [xStatus,setXStatus]=useState('');
@@ -4044,93 +4188,136 @@ function ImportarExtrato({go}){
   async function handle(file){
     if(!file) return;
     setBusy(true); setProg('Recebendo arquivo…');
-    const aiKeys={ cKey:(db.settings?.anthropicKey||'').trim(), cModel:db.settings?.anthropicModel,
-                   gKey:(db.settings?.geminiKey||'').trim(), gModel:db.settings?.geminiModel };
+    const aiKeys={cKey:(db.settings?.anthropicKey||'').trim(),cModel:db.settings?.anthropicModel,
+                  gKey:(db.settings?.geminiKey||'').trim(),gModel:db.settings?.geminiModel};
     try{
       const {rows,meta}=await readStatement(file,setProg,aiKeys);
-      if(!rows.length){ db.toast('Não encontrei movimentações. Tente o PDF do extrato, um OFX (mais preciso) ou CSV do seu banco.','warn'); setBusy(false); setProg(''); return; }
-      const enriched=rows.map(r=>{ const cat=r.type==='despesa'?db.applyRules({descOrig:r.descOrig,amount:r.amount}):{}; return {...r,categoryId:cat.categoryId||null}; });
-      // detecção de duplicatas: despesas contra Lançamentos; receitas contra a auditoria já importada
+      if(!rows.length){db.toast('Não encontrei movimentações. Tente o PDF do extrato, um OFX (mais preciso) ou CSV do seu banco.','warn');setBusy(false);setProg('');return;}
+      // v94: classificar cada linha individualmente
+      const enriched=rows.map(r=>{
+        const cat=r.type==='despesa'?db.applyRules({descOrig:r.descOrig,amount:r.amount}):{};
+        const cls=classifyMovement(r.descOrig||'',r.type);
+        const mt=MOV_TYPES[cls.movType]||MOV_TYPES.nao_classificado;
+        // detectar match com gasto fixo
+        const mk=monthKey(r.date);
+        const fm=db.settings?.fixedMonthly||{};
+        const fx=(db.fixed||[]).find(f=>fixedVigente(f,mk)&&Math.abs(fixedAmount(f,mk,fm)-r.amount)<=Math.max(1,0.05*r.amount));
+        return {...r,
+          categoryId:cat.categoryId||null,
+          _movType:cls.movType,
+          _movConf:cls.confidence,
+          _impactaSaldo:mt.impactaSaldo,
+          _criaDespesa:mt.criaDespesa,
+          _fixedMatch:fx?(fx.name||db.catName(fx.categoryId)||'gasto fixo'):null,
+          _include:true,
+        };
+      });
+      // detectar duplicatas
       const desp=enriched.filter(r=>r.type==='despesa');
       const rec=enriched.filter(r=>r.type==='receita');
-      findDuplicates(desp, db.transactions).forEach((x,i)=>{ desp[i]._dup=x.dup; });
-      findDuplicates(rec, (db.auditIncomes||[])).forEach((x,i)=>{ rec[i]._dup=x.dup; });
-      // conciliação de débito: marca pagamentos de fatura de cartão (duplicam a fatura importada
-      // à parte) e débitos que casam com um gasto fixo já cadastrado no mês.
-      const fm=db.settings?.fixedMonthly||{};
-      enriched.forEach(r=>{ if(r.type!=='despesa') return;
-        if(looksLikeCardBill(r.descOrig)) r._cardBill=true;
-        const mk=monthKey(r.date);
-        const fx=(db.fixed||[]).find(f=>fixedVigente(f,mk)&&Math.abs(fixedAmount(f,mk,fm)-r.amount)<=Math.max(1,0.05*r.amount));
-        if(fx) r._fixedMatch=(fx.name||db.catName(fx.categoryId)||'gasto fixo');
-      });
-      enriched.forEach(r=>{ r._include = !r._dup && !r._cardBill; });
-      const flagged=enriched.filter(r=>r._dup||r._cardBill).length;
-      // §B5 — destino padrão: primeira conta bancária cadastrada; competência = mês mais recente do extrato.
+      findDuplicates(desp,db.transactions).forEach((x,i)=>{desp[i]._dup=x.dup;});
+      findDuplicates(rec,(db.auditIncomes||[])).forEach((x,i)=>{rec[i]._dup=x.dup;});
+      // marcar duplicatas como não incluir por padrão
+      enriched.forEach(r=>{if(r._dup)r._include=false;});
       const acc=(db.accounts||[]).find(a=>a.active!==false)||(db.accounts||[])[0];
       setAcctId(acc?acc.id:'');
       const ms=enriched.map(r=>r.date&&monthKey(r.date)).filter(Boolean).sort();
-      setCompMk(ms.length?ms[ms.length-1]:monthKey(todayISO())); setForceComp(false);
+      setCompMk(ms.length?ms[ms.length-1]:monthKey(todayISO()));setForceComp(false);
       setData({rows:enriched,meta:meta||{},fileName:file.name,file});
-      db.toast(flagged? `${rows.length} movimentações lidas — ${flagged} sinalizada(s) para conciliação (duplicata ou pagamento de fatura) e já desmarcada(s).` : `${rows.length} movimentação(ões) lida(s).`, flagged?'warn':undefined);
+      const needReview=enriched.filter(r=>r._movConf!=='high'||r._movType==='nao_classificado').length;
+      db.toast(needReview?`${rows.length} movimentação(ões) — ${needReview} precisam de revisão de classificação.`:`${rows.length} movimentação(ões) lida(s) e classificada(s).`,needReview?'warn':undefined);
     }catch(e){
-      if(e.message==='PDF_PASSWORD'||e.message==='PDF_PASSWORD_WRONG'){ db.toast('Este PDF está protegido por senha. Abra-o no leitor e salve sem proteção, ou use o OFX do banco.','err'); }
+      if(e.message==='PDF_PASSWORD'||e.message==='PDF_PASSWORD_WRONG')db.toast('Este PDF está protegido por senha.','err');
       else db.toast('Erro ao ler o arquivo: '+(e.message||e),'err');
     }
-    setBusy(false); setProg('');
+    setBusy(false);setProg('');
   }
-  const onDrop=e=>{ e.preventDefault(); setDrag(false); const f=e.dataTransfer.files?.[0]; if(f) handle(f); };
-
+  const onDrop=e=>{e.preventDefault();setDrag(false);const f=e.dataTransfer.files?.[0];if(f)handle(f);};
   const setRow=(i,patch)=>setData(d=>({...d,rows:d.rows.map((r,k)=>k===i?{...r,...patch}:r)}));
-  const dupRows=data?data.rows.filter(r=>r._dup):[];
-  const dupIncluded=dupRows.filter(r=>r._include).length;
-  function toggleDups(){ const turnOn=dupIncluded===0; setData(d=>({...d,rows:d.rows.map(r=>r._dup?{...r,_include:turnOn}:r)})); }
-  const billRows=data?data.rows.filter(r=>r._cardBill):[];
-  const billIncluded=billRows.filter(r=>r._include).length;
-  function toggleBills(){ const turnOn=billIncluded===0; setData(d=>({...d,rows:d.rows.map(r=>r._cardBill?{...r,_include:turnOn}:r)})); }
+
+  // Atualizar criaDespesa quando movType muda
+  function changeMovType(i,newMovType){
+    const mt=MOV_TYPES[newMovType]||MOV_TYPES.nao_classificado;
+    setRow(i,{_movType:newMovType,_criaDespesa:mt.criaDespesa,_impactaSaldo:mt.impactaSaldo});
+  }
+
   const included=data?data.rows.filter(r=>r._include):[];
-  const despesas=included.filter(r=>r.type==='despesa');
+  const comDespesa=included.filter(r=>r._criaDespesa&&r.type!=='receita');
+  const semDespesa=included.filter(r=>!r._criaDespesa&&r.type!=='receita');
+  const faturas=included.filter(r=>r._movType==='pagamento_fatura');
+  const transferencias=included.filter(r=>r._movType==='transferencia_propria');
+  const naoClass=included.filter(r=>r._movType==='nao_classificado');
   const receitas=included.filter(r=>r.type==='receita');
-  const totDesp=round2(despesas.reduce((s,r)=>s+r.amount,0));
-  const totRec=round2(receitas.reduce((s,r)=>s+r.amount,0));
+  const needReview=included.filter(r=>r._movConf!=='high'||r._movType==='nao_classificado');
 
   async function confirm(){
     if(!included.length) return db.toast('Selecione ao menos uma movimentação.','warn');
+    // alertas obrigatórios antes de confirmar
+    const baixaConf=included.filter(r=>r._movType==='pagamento_fatura'&&r._movConf==='low');
+    const trfSemDest=transferencias.filter(r=>!r._destAcctId);
+    if(baixaConf.length||trfSemDest.length||naoClass.length){
+      const msgs=[];
+      if(baixaConf.length) msgs.push(`${baixaConf.length} pagamento(s) de fatura com baixa confiança`);
+      if(trfSemDest.length) msgs.push(`${trfSemDest.length} transferência(s) sem conta de destino`);
+      if(naoClass.length) msgs.push(`${naoClass.length} movimentação(ões) não classificada(s)`);
+      if(!window.confirm(`Atenção:\n${msgs.join('\n')}\n\nDeseja continuar mesmo assim?`)) return;
+    }
     const banco=data.meta.banco||'';
     const acct=db.accountById(acctId);
-    const payType='conta';
-    const despPayload=despesas.map(r=>({date:r.date,descOrig:r.descOrig,amount:r.amount,type:'despesa',
-      categoryId:r.categoryId||null,subcategory:r.subcategory||null,banco,confidence:r.confidence||0.9,
-      accountId:acctId||null,cardId:null,paymentType:payType, ...(forceComp?{compMk}:{})}));
-    const recPayload=receitas.map(r=>({date:r.date,descOrig:r.descOrig,amount:r.amount,banco}));
-    const fileMeta={name:data.fileName,bank:banco,type:banco?('extrato · '+banco):'extrato',account:acct?acct.name:''};
-    try{ if(data.file && data.file.size<=6*1024*1024){
+    const fileId=db.uid?db.uid('file'):('file_'+Math.random().toString(36).slice(2));
+    const now=new Date().toISOString();
+    let fileMeta={name:data.fileName,bank:banco,type:banco?('extrato · '+banco):'extrato',account:acct?acct.name:''};
+    try{if(data.file&&data.file.size<=6*1024*1024){
       const dataUrl=await new Promise((res,rej)=>{const rd=new FileReader();rd.onload=()=>res(rd.result);rd.onerror=rej;rd.readAsDataURL(data.file);});
-      fileMeta.dataUrl=dataUrl; fileMeta.mime=data.file.type||''; fileMeta.size=data.file.size;
+      fileMeta.dataUrl=dataUrl;fileMeta.mime=data.file.type||'';fileMeta.size=data.file.size;
     }}catch(e){}
-    db.addStatement({despesas:despPayload,receitas:recPayload,fileMeta});
-    db.toast(`✓ Extrato importado! ${despPayload.length} despesa(s) em Lançamentos e ${recPayload.length} receita(s) para auditoria.`);
+    // Separar por tipo e chamar o handler correto
+    const despPayload=included.filter(r=>r._criaDespesa&&r.type!=='receita').map(r=>({
+      date:r.date,descOrig:r.descOrig,amount:r.amount,type:'despesa',
+      categoryId:r.categoryId||null,subcategory:r.subcategory||null,banco,
+      confidence:r.confidence||0.9,accountId:acctId||null,cardId:null,
+      paymentType:r._movType==='debito_automatico'?'debito_automatico':r._movType==='boleto'?'boleto':r._movType==='pix_terceiro'?'pix':'conta',
+      movementType:r._movType,...(forceComp?{compMk}:{}),
+    }));
+    const billPayload=included.filter(r=>r._movType==='pagamento_fatura').map(r=>({
+      date:r.date,descOrig:r.descOrig,amount:r.amount,banco,
+      accountId:acctId||null,confidence:r._movConf,
+    }));
+    const recPayload=receitas.map(r=>({date:r.date,descOrig:r.descOrig,amount:r.amount,banco}));
+    const patrimonialPayload=included.filter(r=>['aplicacao','saque','estorno','ajuste_saldo'].includes(r._movType)).map(r=>({
+      date:r.date,descOrig:r.descOrig,amount:r.amount,banco,movementType:r._movType,accountId:acctId||null,
+    }));
+    db.addStatement({despesas:despPayload,billPayments:billPayload,receitas:recPayload,patrimonial:patrimonialPayload,fileMeta});
+    const tot=despPayload.length+billPayload.length+recPayload.length+patrimonialPayload.length;
+    db.toast(`✓ Extrato importado! ${despPayload.length} despesa(s), ${billPayload.length} pag. fatura, ${recPayload.length} receita(s).`);
     setData(null);
-    // §nav — leva direto aos lançamentos recém-importados (filtro por origem, demais filtros limpos)
-    if(go && despPayload.length) go('lancamentos',{origin:'extrato',clear:true});
+    if(go&&despPayload.length) go('lancamentos',{origin:'extrato',clear:true});
   }
-  function applyBulkCat(){ if(!bulkCat) return;
-    setData(d=>({...d,rows:d.rows.map(r=>(r._include&&r.type==='despesa')?{...r,categoryId:bulkCat,subcategory:bulkSub||r.subcategory||null}:r)}));
-    db.toast(bulkSub?'Categoria e subcategoria aplicadas às despesas marcadas.':'Categoria aplicada às despesas marcadas.');
-  }
+
+  const CONF_LABELS={'high':'Alta','medium':'Média','low':'Baixa'};
+  const CONF_COLORS={'high':'var(--pos)','medium':'var(--warn)','low':'var(--neg)'};
 
   if(data) return <div>
     <div className="page-head"><div><h1>Conferir extrato</h1>
-      <p className="muted">{data.fileName}{data.meta.banco?` · ${data.meta.banco}`:''} — despesas vão para Lançamentos (débito em conta); receitas vão para auditoria em Receitas.</p></div>
+      <p className="muted">{data.fileName}{data.meta.banco?` · ${data.meta.banco}`:''}</p></div>
       <div className="row" style={{gap:8}}>
         <button className="btn" onClick={()=>setData(null)}>Cancelar</button>
-        <button className="btn primary" onClick={confirm}>Importar {included.length}</button></div></div>
-
-    <div className="kpi-row">
-      <div className="kpi neg"><span>Despesas ({despesas.length})</span><b>{BRL(totDesp)}</b></div>
-      <div className="kpi pos"><span>Receitas ({receitas.length})</span><b>{BRL(totRec)}</b></div>
-      <div className="kpi"><span>Selecionadas</span><b>{included.length} de {data.rows.length}</b></div>
+        <button className="btn primary" onClick={confirm}>Importar {included.length}</button>
+      </div>
     </div>
+
+    {/* Resumo v94 */}
+    <div className="kpi-row">
+      <div className="kpi neg"><span>Criam despesa</span><b>{comDespesa.length}</b></div>
+      <div className="kpi"><span>Pag. fatura</span><b>{faturas.length}</b></div>
+      <div className="kpi"><span>Transferências</span><b>{transferencias.length}</b></div>
+      <div className="kpi pos"><span>Receitas</span><b>{receitas.length}</b></div>
+      <div className="kpi" style={{borderLeft:'2px solid var(--warn)'}}><span>Precisam revisão</span><b>{needReview.length}</b></div>
+    </div>
+
+    {naoClass.length>0&&<div className="card pad" style={{marginBottom:14,borderLeft:'3px solid var(--neg)'}}>
+      <span style={{fontSize:13}}><Icon name="alert" size={14}/> <b>{naoClass.length} movimentação(ões) não classificada(s)</b> — defina o tipo antes de importar. Não criarão despesa.</span>
+    </div>}
 
     <div className="card pad" style={{marginBottom:14}}>
       <div className="row" style={{gap:16,alignItems:'flex-start',flexWrap:'wrap'}}>
@@ -4140,103 +4327,104 @@ function ImportarExtrato({go}){
             <option value="">— não vincular a uma conta —</option>
             {(db.accounts||[]).filter(a=>a.active!==false).map(a=><option key={a.id} value={a.id}>{a.name}{a.bank?` · ${a.bank}`:''}</option>)}
           </select>
-          <div className="muted" style={{fontSize:11.5,marginTop:6}}>
-            {acctId
-              ? <React.Fragment>As despesas ficam vinculadas a <b style={{color:'var(--ink)'}}>{(db.accountById(acctId)||{}).name}</b> e entram no saldo e extrato dessa conta.</React.Fragment>
-              : 'Sem vínculo, as despesas são importadas sem conta de origem e não alteram saldo de nenhuma conta.'}
-          </div>
         </div>
         <div style={{flex:'1 1 240px'}}>
           <label style={{display:'flex',gap:7,alignItems:'center',marginBottom:6}} className="lbl">
-            <input type="checkbox" checked={forceComp} onChange={e=>setForceComp(e.target.checked)} style={{accentColor:'var(--accent)'}}/> Forçar um mês de competência</label>
-          {forceComp
-            ? <div className="row" style={{gap:8}}>
-                <select className="input" style={{width:'auto'}} value={compMk.slice(5,7)} onChange={e=>setCompMk(`${compMk.slice(0,4)}-${e.target.value}`)}>
-                  {MESES_PT.map((nm,i)=>{const mm=String(i+1).padStart(2,'0');return <option key={mm} value={mm}>{nm}</option>;})}</select>
-                <select className="input" style={{width:'auto'}} value={compMk.slice(0,4)} onChange={e=>setCompMk(`${e.target.value}-${compMk.slice(5,7)}`)}>
-                  {yearOptions(data.rows.map(r=>r.date&&r.date.slice(0,4))).map(y=><option key={y} value={y}>{y}</option>)}</select>
-              </div>
-            : <span className="muted" style={{fontSize:11.5}}>Cada movimentação é lançada na própria data (recomendado para extrato). Marque só se quiser concentrar tudo num mês.</span>}
-          {forceComp && <div className="muted" style={{fontSize:11.5,marginTop:6}}>Todas as despesas contam em <b style={{color:'var(--ink)'}}>{monthLong(compMk)}</b>.</div>}
+            <input type="checkbox" checked={forceComp} onChange={e=>setForceComp(e.target.checked)} style={{accentColor:'var(--accent)'}}/> Forçar mês de competência</label>
+          {forceComp&&<div className="row" style={{gap:8}}>
+            <select className="input" style={{width:'auto'}} value={compMk.slice(5,7)} onChange={e=>setCompMk(`${compMk.slice(0,4)}-${e.target.value}`)}>
+              {MESES_PT.map((nm,i)=>{const mm=String(i+1).padStart(2,'0');return <option key={mm} value={mm}>{nm}</option>;})}</select>
+            <select className="input" style={{width:'auto'}} value={compMk.slice(0,4)} onChange={e=>setCompMk(`${e.target.value}-${compMk.slice(5,7)}`)}>
+              {yearOptions(data.rows.map(r=>r.date&&r.date.slice(0,4))).map(y=><option key={y} value={y}>{y}</option>)}</select>
+          </div>}
         </div>
       </div>
     </div>
 
-    {dupRows.length>0 && <div className="card pad" style={{marginBottom:14,borderLeft:'3px solid var(--warn)'}}>
-      <div className="row" style={{justifyContent:'space-between',alignItems:'center',gap:10,flexWrap:'wrap'}}>
-        <span style={{fontSize:13}}><Icon name="alert" size={14}/> <b>{dupRows.length} possível(is) duplicata(s)</b> — já existem em lançamentos/auditoria e estão <b>desmarcadas</b>. Veja o item já lançado na própria linha antes de decidir.</span>
-        <button className="btn sm" onClick={toggleDups}>{dupIncluded===0?'Incluir duplicatas mesmo assim':'Desmarcar duplicatas'}</button>
-      </div>
-    </div>}
-
-    {billRows.length>0 && <div className="card pad" style={{marginBottom:14,borderLeft:'3px solid var(--neg)'}}>
-      <div className="row" style={{justifyContent:'space-between',alignItems:'center',gap:10,flexWrap:'wrap'}}>
-        <span style={{fontSize:13}}><Icon name="alert" size={14}/> <b>{billRows.length} pagamento(s) de fatura de cartão</b> — costumam <b>duplicar</b> a fatura importada (as compras já entram item a item). Desmarcados para evitar análise inflada.</span>
-        <button className="btn sm" onClick={toggleBills}>{billIncluded===0?'Incluir mesmo assim':'Desmarcar'}</button>
-      </div>
-    </div>}
-
-    <div className="card pad" style={{marginBottom:14}}>
-      <div className="row" style={{gap:10,alignItems:'center',flexWrap:'wrap'}}>
-        <b style={{fontSize:13}}>Categoria em massa</b>
-        <span className="muted" style={{fontSize:12}}>aplica às {despesas.length} despesa(s) marcada(s)</span>
-        <select className="input" style={{width:'auto'}} value={bulkCat} onChange={e=>{setBulkCat(e.target.value);setBulkSub('');}}>
-          <option value="">Categoria…</option>{db.categories.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select>
-        <select className="input" style={{width:'auto'}} value={bulkSub} disabled={!bulkCat} onChange={e=>setBulkSub(e.target.value)} title={bulkCat?'Subcategoria (opcional)':'Escolha a categoria primeiro'}>
-          <option value="">Subcategoria (opcional)…</option>
-          {((db.categories.find(c=>c.id===bulkCat)||{}).subs||[]).map(s=><option key={s} value={s}>{s}</option>)}</select>
-        <button className="btn sm" disabled={!bulkCat||!despesas.length} onClick={applyBulkCat}>Aplicar às marcadas</button>
-      </div>
-    </div>
-
-    <div className="card"><div className="tbl-wrap"><table className="tbl"><thead><tr>
-      <th style={{width:36}}></th><th className="num">Data</th><th>Descrição</th><th>Tipo</th><th className="r">Valor</th><th>Categoria (despesa)</th>
-    </tr></thead><tbody>
-      {data.rows.map((r,i)=><tr key={i} style={{opacity:r._include?1:.5}}>
-        <td><input type="checkbox" checked={r._include} onChange={e=>setRow(i,{_include:e.target.checked})} style={{width:16,height:16,accentColor:'var(--accent)'}}/></td>
-        <td className="num">{ptDate(r.date)}</td>
-        <td>
-          <div>{r.descOrig}</div>
-          <div style={{display:'flex',gap:4,flexWrap:'wrap',marginTop:2}}>
-            {r._dup&&<span className="chip" style={{background:'var(--warn-soft)',color:'var(--warn)'}}>duplicada</span>}
-            {r._cardBill&&<span className="chip" style={{background:'var(--neg-soft)',color:'var(--neg)'}}>pagamento de fatura?</span>}
-            {r._fixedMatch&&<span className="chip" title="Valor compatível com um gasto fixo cadastrado neste mês">≈ gasto fixo: {r._fixedMatch}</span>}
-          </div>
-          {r._dup&&<div className="muted" style={{fontSize:11,marginTop:3}}>↔ já lançado: {ptDate(r._dup.date)} · {r._dup.descPad||r._dup.descOrig} · {BRL(r._dup.amount)} <span style={{opacity:.8}}>({({extrato:'extrato',import:'fatura',demo:'demo'}[r._dup.origin])||'manual'})</span></div>}
-        </td>
-        <td>{r.type==='receita'?<span className="chip pos">receita</span>:<span className="chip" style={{background:'var(--neg-soft)',color:'var(--neg)'}}>despesa</span>}</td>
-        <td className="r num">{BRL(r.amount)}</td>
-        <td>{r.type==='despesa'
-          ? <select className="input" style={{minWidth:150}} value={r.categoryId||''} onChange={e=>setRow(i,{categoryId:e.target.value||null})}>
-              <option value="">— sem categoria —</option>
-              {db.categories.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select>
-          : <span className="muted" style={{fontSize:12}}>auditoria de receitas</span>}</td>
-      </tr>)}
-    </tbody></table></div></div>
+    {/* Tabela principal v94 */}
+    <div className="card"><div className="tbl-wrap"><table className="tbl">
+      <thead><tr>
+        <th style={{width:36}}></th>
+        <th>Movimentação</th>
+        <th>Classificação (v94)</th>
+        <th style={{width:90,textAlign:'center'}}>Impacta saldo</th>
+        <th style={{width:90,textAlign:'center'}}>Cria despesa</th>
+        <th>Categoria</th>
+        <th style={{width:80,textAlign:'center'}}>Confiança</th>
+      </tr></thead>
+      <tbody>
+        {data.rows.map((r,i)=>{
+          const mt=MOV_TYPES[r._movType]||MOV_TYPES.nao_classificado;
+          const confColor=CONF_COLORS[r._movConf]||'var(--ink)';
+          const isFatura=r._movType==='pagamento_fatura';
+          const isReceita=r.type==='receita';
+          return <tr key={i} style={{opacity:r._include?1:.45}}>
+            <td><input type="checkbox" checked={!!r._include} onChange={e=>setRow(i,{_include:e.target.checked})} style={{width:16,height:16,accentColor:'var(--accent)'}}/></td>
+            <td>
+              <div style={{fontWeight:500}}>{r.descOrig}</div>
+              <div className="muted" style={{fontSize:11.5,marginTop:2}}>{ptDate(r.date)} · {BRL(r.amount)} · {isReceita?<span style={{color:'var(--pos)'}}>entrada</span>:<span style={{color:'var(--neg)'}}>saída</span>}</div>
+              {r._dup&&<div className="muted" style={{fontSize:11,marginTop:2,color:'var(--warn)'}}>↔ possível duplicata: {ptDate(r._dup.date)} · {BRL(r._dup.amount)}</div>}
+              {r._fixedMatch&&<div className="muted" style={{fontSize:11,marginTop:2}}>≈ gasto fixo: {r._fixedMatch}</div>}
+            </td>
+            <td>
+              {isReceita
+                ? <span className="chip pos" style={{fontSize:12}}>Entrada / receita</span>
+                : <select className="input" style={{fontSize:12,padding:'4px 6px',minWidth:180}}
+                    value={r._movType} onChange={e=>changeMovType(i,e.target.value)}>
+                    {Object.entries(MOV_TYPES).filter(([k])=>k!=='entrada').map(([k,v])=>
+                      <option key={k} value={k}>{v.label}</option>)}
+                  </select>}
+            </td>
+            <td style={{textAlign:'center'}}>
+              <span style={{color:'var(--pos)',fontWeight:600,fontSize:13}}>✓</span>
+            </td>
+            <td style={{textAlign:'center'}}>
+              {isReceita
+                ? <span className="muted" style={{fontSize:12}}>—</span>
+                : r._criaDespesa
+                  ? <span style={{color:'var(--pos)',fontWeight:600,fontSize:13}}>✓</span>
+                  : <span style={{color:'var(--neg)',fontWeight:600,fontSize:13}}>✗</span>}
+              {isFatura&&<div style={{fontSize:10,color:'var(--accent)',marginTop:2}}>somente saída bancária</div>}
+            </td>
+            <td>
+              {(r._criaDespesa&&!isReceita)
+                ? <select className="input" style={{minWidth:140,fontSize:12}} value={r.categoryId||''} onChange={e=>setRow(i,{categoryId:e.target.value||null})}>
+                    <option value="">— sem categoria —</option>
+                    {db.categories.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                : <span className="muted" style={{fontSize:12}}>{isFatura?'vinculada à fatura':isReceita?'auditoria de receitas':'sem despesa'}</span>}
+            </td>
+            <td style={{textAlign:'center'}}>
+              <span style={{fontSize:11,fontWeight:600,color:confColor}}>{CONF_LABELS[r._movConf]||'—'}</span>
+            </td>
+          </tr>;
+        })}
+      </tbody>
+    </table></div></div>
   </div>;
 
   return <div className="grid" style={{gap:18}}>
     <div className="page-head" style={{marginBottom:0}}><div><h1>Importar extrato bancário</h1>
-      <p className="muted">Movimentações da conta: PIX, débito, TED, boletos, débito automático. As despesas vão para Lançamentos como "débito em conta"; as receitas ficam separadas, para auditoria.</p></div></div>
+      <p className="muted">Movimentações da conta. Cada linha é classificada individualmente — pagamento de fatura não gera nova despesa (v94).</p></div></div>
 
     <div className="card pad">
       <div className={'dropzone'+(drag?' drag':'')}
         onDragOver={e=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)} onDrop={onDrop}
         onClick={()=>!busy&&fileRef.current&&fileRef.current.click()}>
-        {busy? <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:12}}>
+        {busy?<div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:12}}>
             <div><span className="spin"/> <b style={{marginLeft:8}}>{prog||'Lendo arquivo…'}</b></div></div>
-          : <React.Fragment>
+          :<React.Fragment>
             <div style={{fontSize:34}}><Icon name="import" size={34}/></div>
             <h3 style={{margin:'10px 0 4px'}}>Arraste o extrato aqui ou clique para selecionar</h3>
             <div className="muted">PDF do extrato, OFX (mais preciso) ou CSV — baixe no app/site do seu banco</div>
           </React.Fragment>}
-        <input ref={fileRef} type="file" hidden accept=".pdf,.ofx,.qfx,.csv,.txt" onChange={e=>{const f=e.target.files[0]; e.target.value=''; handle(f);}}/>
+        <input ref={fileRef} type="file" hidden accept=".pdf,.ofx,.qfx,.csv,.txt" onChange={e=>{const f=e.target.files[0];e.target.value='';handle(f);}}/>
       </div>
-      <div className="row" style={{marginTop:14,fontSize:12.5}}>
-        <div className="chip"><Icon name="check" size={13}/> Leitura de PDF, OFX e CSV</div>
-        <div className="chip"><Icon name="check" size={13}/> Detecção de banco</div>
-        <div className="chip"><Icon name="check" size={13}/> Despesa = débito em conta</div>
-        <div className="chip"><Icon name="check" size={13}/> Receita vai para auditoria</div>
+      <div className="row" style={{marginTop:14,fontSize:12.5,flexWrap:'wrap',gap:6}}>
+        <div className="chip"><Icon name="check" size={13}/> 13 tipos de movimentação</div>
+        <div className="chip"><Icon name="check" size={13}/> Pag. fatura ≠ despesa (v94)</div>
+        <div className="chip"><Icon name="check" size={13}/> Classificação por linha</div>
+        <div className="chip"><Icon name="check" size={13}/> Confiança da detecção</div>
         <div className="chip"><Icon name="check" size={13}/> Conferência antes de salvar</div>
       </div>
     </div>
@@ -4246,25 +4434,25 @@ function ImportarExtrato({go}){
       const bancos=[...new Set(extFiles.map(f=>f.bank).filter(Boolean))].sort((a,b)=>collatorPT.compare(a,b));
       const nDesp=f=>db.transactions.filter(t=>t.fileId===f.id).length;
       const nRec=f=>(db.auditIncomes||[]).filter(a=>a.fileId===f.id).length;
-      const statusOf=f=>{ const tx=db.transactions.filter(t=>t.fileId===f.id); if(!tx.length) return 'vazio'; return tx.some(t=>t.confStatus==='revisar')?'revisar':'ok'; };
+      const statusOf=f=>{const tx=db.transactions.filter(t=>t.fileId===f.id);if(!tx.length)return 'vazio';return tx.some(t=>t.confStatus==='revisar')?'revisar':'ok';};
       const filtered=extFiles.filter(f=>{
         const iso=fileD(f);
-        if(xAno!=='all' && iso.slice(0,4)!==xAno) return false;
-        if(xMes!=='all' && iso.slice(5,7)!==xMes) return false;
-        if(xBanco && (f.bank||'')!==xBanco) return false;
-        if(xTipo==='despesa' && nDesp(f)===0) return false;
-        if(xTipo==='receita' && nRec(f)===0) return false;
-        if(xStatus && statusOf(f)!==xStatus) return false;
-        if(xBusca && !(f.name||'').toLowerCase().includes(xBusca.toLowerCase())) return false;
+        if(xAno!=='all'&&iso.slice(0,4)!==xAno) return false;
+        if(xMes!=='all'&&iso.slice(5,7)!==xMes) return false;
+        if(xBanco&&(f.bank||'')!==xBanco) return false;
+        if(xTipo==='despesa'&&nDesp(f)===0) return false;
+        if(xTipo==='receita'&&nRec(f)===0) return false;
+        if(xStatus&&statusOf(f)!==xStatus) return false;
+        if(xBusca&&!(f.name||'').toLowerCase().includes(xBusca.toLowerCase())) return false;
         return true;
       });
       const active=(xAno!=='all'?1:0)+(xMes!=='all'?1:0)+(xBanco?1:0)+(xTipo?1:0)+(xStatus?1:0)+(xBusca?1:0);
       const groups=groupByYM(filtered,fileD);
       const extRow=f=>{
-        const fileAcct=()=>{ const cs=[...new Set(db.transactions.filter(t=>t.fileId===f.id).map(t=>t.accountId||''))]; return cs.length===1?cs[0]:''; };
+        const fileAcct=()=>{const cs=[...new Set(db.transactions.filter(t=>t.fileId===f.id).map(t=>t.accountId||''))];return cs.length===1?cs[0]:'';};
         const assignAccount=acctId=>{
           const ids=db.transactions.filter(t=>t.fileId===f.id).map(t=>t.id);
-          if(!ids.length){ db.toast('Este extrato não tem despesas para vincular.','warn'); return; }
+          if(!ids.length){db.toast('Este extrato não tem despesas para vincular.','warn');return;}
           const acct=db.accountById(acctId);
           db.bulkUpdate(ids,{accountId:acctId||null,cardId:null,paymentType:'conta'});
           db.toast(acctId?`${ids.length} lançamento(s) vinculado(s) a "${acct?acct.name:''}".`:`Vínculo de conta removido (${ids.length} lançamento(s)).`);
@@ -4274,11 +4462,11 @@ function ImportarExtrato({go}){
         const ftotal=round2(ftx.reduce((s,t)=>s+spendOf(t),0));
         return <tr key={f.id}>
           <td>{f.dataUrl
-            ? <a onClick={()=>openSavedFile(f)} style={{cursor:'pointer',color:'var(--accent)',fontWeight:600,display:'inline-flex',alignItems:'center',gap:5}} title="Abrir o arquivo em uma nova aba">{f.name} <Icon name="eye" size={13}/></a>
-            : f.name}</td>
+            ?<a onClick={()=>openSavedFile(f)} style={{cursor:'pointer',color:'var(--accent)',fontWeight:600,display:'inline-flex',alignItems:'center',gap:5}} title="Abrir o arquivo em uma nova aba">{f.name} <Icon name="eye" size={13}/></a>
+            :f.name}</td>
           <td>{f.bank||'—'}</td>
           <td><select className="input" style={{width:150,padding:'5px 7px'}} value={fileAcct()} disabled={!ftx.length}
-            onChange={e=>assignAccount(e.target.value)} title="Vincular as despesas deste extrato a uma conta bancária — elas passam a impactar o saldo dessa conta">
+            onChange={e=>assignAccount(e.target.value)}>
             <option value="">— sem conta —</option>
             {(db.accounts||[]).filter(a=>a.active!==false).map(a=><option key={a.id} value={a.id}>{a.name}</option>)}
           </select></td>
@@ -4300,21 +4488,20 @@ function ImportarExtrato({go}){
           <b>Arquivos importados</b>
           <span className="muted" style={{fontSize:12}}>{filtered.length} de {extFiles.length}</span>
         </div>
-        <div className="muted" style={{fontSize:11.5,marginTop:6}}>Use a coluna <b>Conta vinculada</b> para reatribuir as despesas de um extrato já importado a uma conta — elas passam a aparecer ao abrir essa conta em <b>Cartões e contas</b>.</div>
         <div className="row" style={{gap:10,alignItems:'flex-end',flexWrap:'wrap',marginTop:12}}>
           <Fld label="Ano"><AnoSelect value={xAno} onChange={setXAno} years={yearOptions(extFiles.map(f=>fileD(f).slice(0,4)))}/></Fld>
           <Fld label="Mês"><MesSelect value={xMes} onChange={setXMes}/></Fld>
           <Fld label="Instituição"><select className="input" style={{width:150}} value={xBanco} onChange={e=>setXBanco(e.target.value)}><option value="">Todas</option>{bancos.map(b=><option key={b} value={b}>{b}</option>)}</select></Fld>
-          <Fld label="Tipo de movimentação"><select className="input" style={{width:170}} value={xTipo} onChange={e=>setXTipo(e.target.value)}><option value="">Todas</option><option value="despesa">Com despesas</option><option value="receita">Com receitas</option></select></Fld>
-          <Fld label="Status"><select className="input" style={{width:140}} value={xStatus} onChange={e=>setXStatus(e.target.value)}><option value="">Todos</option><option value="ok">Conferido</option><option value="revisar">A revisar</option></select></Fld>
-          <Fld label="Buscar arquivo"><input className="input" style={{width:170}} value={xBusca} onChange={e=>setXBusca(e.target.value)} placeholder="nome do arquivo"/></Fld>
-          {active>0 && <div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
+          <Fld label="Tipo"><select className="input" style={{width:150}} value={xTipo} onChange={e=>setXTipo(e.target.value)}><option value="">Todas</option><option value="despesa">Com despesas</option><option value="receita">Com receitas</option></select></Fld>
+          <Fld label="Status"><select className="input" style={{width:130}} value={xStatus} onChange={e=>setXStatus(e.target.value)}><option value="">Todos</option><option value="ok">Conferido</option><option value="revisar">A revisar</option></select></Fld>
+          <Fld label="Buscar"><input className="input" style={{width:160}} value={xBusca} onChange={e=>setXBusca(e.target.value)} placeholder="nome do arquivo"/></Fld>
+          {active>0&&<div style={{marginLeft:'auto',display:'flex',gap:8,alignItems:'center'}}>
             <span className="chip pos"><Icon name="check" size={12}/> {active} filtro{active>1?'s':''}</span>
             <button className="btn ghost sm" onClick={()=>{setXAno('all');setXMes('all');setXBanco('');setXTipo('');setXStatus('');setXBusca('');}}><Icon name="x" size={13}/> Limpar</button></div>}
         </div>
         {groups.length===0
-          ? <div className="muted" style={{padding:'18px 0'}}>Nenhum extrato para os filtros selecionados.</div>
-          : groups.map(g=>g.months.map(mo=><div key={mo.mk}>
+          ?<div className="muted" style={{padding:'18px 0'}}>Nenhum extrato para os filtros selecionados.</div>
+          :groups.map(g=>g.months.map(mo=><div key={mo.mk}>
               <GroupHead title={mo.label} count={mo.items.length}/>
               <div className="tbl-wrap"><table className="tbl">{head}<tbody>{mo.items.map(extRow)}</tbody></table></div>
             </div>))}
@@ -4322,14 +4509,13 @@ function ImportarExtrato({go}){
     })()}
 
     <div className="card pad">
-      <h3 style={{marginTop:0}}>Como funciona</h3>
+      <h3 style={{marginTop:0}}>Como funciona (v94)</h3>
       <p className="muted" style={{fontSize:13,lineHeight:1.6,margin:0}}>
-        Cada movimentação é classificada pelo sinal: valor que <b>saiu</b> da conta vira <b>despesa</b> (vai para Lançamentos como débito em conta, na data em que ocorreu); valor que <b>entrou</b> vira <b>receita</b> e fica guardada na aba <b>Receitas → Auditoria</b>, sem afetar seus relatórios — serve para você conferir e conciliar com as receitas que cadastrou manualmente. O <b>PDF de extrato</b> (inclusive de semestre, com várias páginas) já é lido pela camada de texto; quando o texto não basta, o sistema usa IA/OCR como reserva. As linhas de <b>SALDO DO DIA</b> são ignoradas — só entram movimentações reais.
+        Cada linha é classificada individualmente em 13 tipos. <b>Pagamento de fatura</b> impacta o saldo mas <b>não cria nova despesa</b> — as compras já entraram item a item na fatura. <b>Compra no débito</b>, PIX, boleto e débitos automáticos criam despesa normalmente. <b>Transferência entre contas próprias</b> afeta saldo das duas contas, sem criar despesa ou receita. <b>Aplicações</b> são movimentações patrimoniais. Você pode alterar a classificação sugerida antes de confirmar.
       </p>
     </div>
   </div>;
 }
-
 function ReviewScreen({review,setReview}){
   const db=useDB();
   const [rows,setRows]=useState(review.rows);
